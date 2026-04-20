@@ -150,7 +150,8 @@ export default function (pi: ExtensionAPI) {
   const pendingMessages: PendingMessage[] = [];
   let isProcessing = false;
   let currentReqId: string | null = null;
-  let currentReplyTo: { userId: string; contextToken?: string } | null = null;
+  // 使用 Map 跟踪多个待回复的用户，避免被覆盖
+  const replyToMap = new Map<string, { userId: string; contextToken?: string }>();
 
   // ============================================================================
   // 配置管理
@@ -194,21 +195,25 @@ export default function (pi: ExtensionAPI) {
     }
 
     currentReqId = message.reqId;
-    currentReplyTo = { userId: message.userId, contextToken: message.contextToken };
+    // 将用户信息存入 Map，而不是单个变量
+    replyToMap.set(message.reqId, { userId: message.userId, contextToken: message.contextToken });
 
     try {
       await pi.sendUserMessage([{ type: "text", text: message.text }]);
       console.log(`[weixinbot] 消息已发送给AI: reqId=${message.reqId.slice(0, 8)}, user=${message.userId.slice(0, 8)}...`);
     } catch (err: any) {
       console.error(`[weixinbot] 发送消息给AI失败:`, err.message);
-      currentReplyTo = null;
+      replyToMap.delete(message.reqId);
     }
 
-    pendingMessages.shift();
+    // 注意：不要立即从队列移除，等 AI 回复完成后再移除
+    // pendingMessages.shift(); // 移到 message_end 处理中
     isProcessing = false;
     
-    // 继续处理队列中的下一条消息
-    processMessageQueue();
+    // 继续处理队列中的下一条消息（如果有）
+    // 但如果上一条还在等待回复，这里可能会有问题
+    // 暂时只处理一条消息，等回复完成后再处理下一条
+    // processMessageQueue();
   }
 
   // ============================================================================
@@ -578,12 +583,25 @@ export default function (pi: ExtensionAPI) {
   // ============================================================================
 
   pi.on("message_end", async (event) => {
-    if (!currentReplyTo) return;
-
     const message = event.message;
     // 只处理助手消息（AI 回复）
     if (message.role !== "assistant") {
-      currentReplyTo = null;
+      return;
+    }
+
+    // 从队列中取出第一条消息（最早发送给 AI 的）
+    const pendingMsg = pendingMessages[0];
+    if (!pendingMsg) {
+      console.log(`[weixinbot] 收到 AI 回复，但没有待处理的微信消息`);
+      return;
+    }
+
+    // 获取对应的用户信息
+    const replyTo = replyToMap.get(pendingMsg.reqId);
+    if (!replyTo) {
+      console.log(`[weixinbot] 未找到待回复的用户信息: reqId=${pendingMsg.reqId.slice(0, 8)}...`);
+      pendingMessages.shift(); // 清理队列
+      replyToMap.delete(pendingMsg.reqId);
       return;
     }
 
@@ -596,11 +614,13 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (!replyText.trim()) {
-      currentReplyTo = null;
+      console.log(`[weixinbot] AI 回复为空，跳过发送`);
+      pendingMessages.shift(); // 清理队列
+      replyToMap.delete(pendingMsg.reqId);
       return;
     }
 
-    const { userId, contextToken } = currentReplyTo;
+    const { userId, contextToken } = replyTo;
 
     try {
       await sendTextMessage(userId, replyText.trim(), contextToken);
@@ -609,7 +629,12 @@ export default function (pi: ExtensionAPI) {
       console.error(`[weixinbot] 发送 AI 回复失败:`, err.message);
     }
 
-    currentReplyTo = null;
+    // 清理
+    pendingMessages.shift();
+    replyToMap.delete(pendingMsg.reqId);
+    
+    // 继续处理队列中的下一条消息
+    processMessageQueue();
   });
 
   // ============================================================================
