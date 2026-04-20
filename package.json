@@ -1,6 +1,6 @@
 {
   "name": "pi-weixinbot",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "微信机器人 extension for pi，支持扫码登录和消息收发",
   "keywords": [
