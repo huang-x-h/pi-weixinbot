@@ -199,11 +199,14 @@ export default function (pi: ExtensionAPI) {
     replyToMap.set(message.reqId, { userId: message.userId, contextToken: message.contextToken });
 
     try {
-      await pi.sendUserMessage([{ type: "text", text: message.text }]);
+      await pi.sendUserMessage([{ type: "text", text: message.text }], { deliverAs: "followUp" });
       console.log(`[weixinbot] 消息已发送给AI: reqId=${message.reqId.slice(0, 8)}, user=${message.userId.slice(0, 8)}...`);
     } catch (err: any) {
       console.error(`[weixinbot] 发送消息给AI失败:`, err.message);
       replyToMap.delete(message.reqId);
+      pendingMessages.shift(); // 发送失败，从队列移除
+      isProcessing = false;
+      processMessageQueue(); // 继续处理下一条
     }
 
     // 注意：不要立即从队列移除，等 AI 回复完成后再移除
