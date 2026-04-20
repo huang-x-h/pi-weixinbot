@@ -137,6 +137,8 @@ function filterMarkdown(text: string): string {
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
+  // 保存 pi 实例供内部函数使用
+  const piInstance = pi;
   // 初始化
   const SESSION_ID = getSessionId();
 
@@ -146,12 +148,37 @@ export default function (pi: ExtensionAPI) {
   let currentAccount: (WeixinAccountData & { accountId: string }) | null = null;
   let isConnected = false;
   let monitorAbortController: AbortController | null = null;
+  let loginInProgress = false;
 
   const pendingMessages: PendingMessage[] = [];
   let isProcessing = false;
   let currentReqId: string | null = null;
   // 使用 Map 跟踪多个待回复的用户，避免被覆盖
   const replyToMap = new Map<string, { userId: string; contextToken?: string }>();
+
+  // ============================================================================
+  // 状态栏更新
+  // ============================================================================
+
+  function updateStatus(ctx: any) {
+    if (!ctx?.ui?.setStatus) return;
+
+    let status = "[微信]";
+
+    if (loginInProgress) {
+      status += " ⏳ 登录中...";
+    } else if (!currentAccount) {
+      status += " ⚪ 未登录";
+    } else if (isConnected) {
+      const accountShort = currentAccount.accountId.slice(0, 8);
+      const pending = pendingMessages.length;
+      status += ` ✅ 已连接 | ${accountShort}... | 待处理:${pending}`;
+    } else {
+      status += " ❌ 已断开";
+    }
+
+    ctx.ui.setStatus("weixinbot", status);
+  }
 
   // ============================================================================
   // 配置管理
@@ -175,9 +202,12 @@ export default function (pi: ExtensionAPI) {
   // 消息队列处理
   // ============================================================================
 
-  async function processMessageQueue() {
+  async function processMessageQueue(ctx?: any) {
     if (isProcessing || pendingMessages.length === 0) return;
     isProcessing = true;
+
+    // 更新状态栏显示待处理消息数
+    if (ctx) updateStatus(ctx);
 
     const message = pendingMessages[0];
     if (!message) {
@@ -190,7 +220,7 @@ export default function (pi: ExtensionAPI) {
       console.log(`[weixinbot] 账户不匹配，跳过消息`);
       pendingMessages.shift();
       isProcessing = false;
-      processMessageQueue();
+      processMessageQueue(ctx);
       return;
     }
 
@@ -206,7 +236,7 @@ export default function (pi: ExtensionAPI) {
       replyToMap.delete(message.reqId);
       pendingMessages.shift(); // 发送失败，从队列移除
       isProcessing = false;
-      processMessageQueue(); // 继续处理下一条
+      processMessageQueue(ctx); // 继续处理下一条
     }
 
     // 注意：不要立即从队列移除，等 AI 回复完成后再移除
@@ -223,7 +253,7 @@ export default function (pi: ExtensionAPI) {
   // 微信消息监控
   // ============================================================================
 
-  async function startMonitor() {
+  async function startMonitor(piInstance?: ExtensionAPI) {
     if (!currentAccount?.token || !currentAccount.accountId) {
       console.log(`[weixinbot] 无法启动监控：未登录`);
       return;
@@ -257,6 +287,14 @@ export default function (pi: ExtensionAPI) {
             // Session 过期
             console.log(`[weixinbot] Session 已过期，请重新登录`);
             isConnected = false;
+            // 发送通知给用户
+            if (piInstance) {
+              piInstance.sendMessage({
+                customType: "weixinbot-status",
+                content: "⚠️ 微信 Session 已过期，请使用 /weixin-login 重新登录",
+                display: true,
+              }, { deliverAs: "steer", triggerTurn: false });
+            }
             return;
           }
         }
@@ -355,9 +393,11 @@ export default function (pi: ExtensionAPI) {
   // 登录/登出
   // ============================================================================
 
-  async function performLogin(): Promise<boolean> {
+  async function performLogin(ctx?: any): Promise<boolean> {
     try {
       console.log(`[weixinbot] 开始微信扫码登录...`);
+      loginInProgress = true;
+      updateStatus(ctx);
 
       const result = await fullQRLogin({
         onStatus: (status, message) => {
@@ -369,6 +409,8 @@ export default function (pi: ExtensionAPI) {
         },
       });
 
+      loginInProgress = false;
+
       if (result.connected && result.accountId) {
         // 加载保存的账户
         const accounts = getLoggedInAccounts();
@@ -379,21 +421,25 @@ export default function (pi: ExtensionAPI) {
           isConnected = true;
 
           // 启动消息监控
-          startMonitor();
+          startMonitor(pi);
 
+          updateStatus(ctx);
           return true;
         }
       }
 
       console.log(`[weixinbot] 登录失败: ${result.message}`);
+      updateStatus(ctx);
       return false;
     } catch (err) {
+      loginInProgress = false;
       console.error(`[weixinbot] 登录异常:`, err);
+      updateStatus(ctx);
       return false;
     }
   }
 
-  async function performLogout(accountId: string): Promise<void> {
+  async function performLogout(accountId: string, ctx?: any): Promise<void> {
     logoutAccount(accountId);
     if (currentAccount?.accountId === accountId) {
       stopMonitor();
@@ -401,6 +447,7 @@ export default function (pi: ExtensionAPI) {
       isConnected = false;
     }
     console.log(`[weixinbot] 已退出登录`);
+    updateStatus(ctx);
   }
 
   // ============================================================================
@@ -465,8 +512,11 @@ export default function (pi: ExtensionAPI) {
     label: "Weixin Status",
     description: "获取当前微信连接状态",
     parameters: Type.Object({}),
-    async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const accounts = getLoggedInAccounts();
+
+      // 更新状态栏
+      updateStatus(ctx);
 
       let statusText = `[weixinbot] 状态:\n`;
       statusText += `- 已登录账户: ${accounts.length}\n`;
@@ -498,7 +548,7 @@ export default function (pi: ExtensionAPI) {
         await ctx.ui.notify("正在启动微信登录...", "info");
       }
 
-      const success = await performLogin();
+      const success = await performLogin(ctx);
 
       if (success) {
         if (ctx.hasUI) {
@@ -529,7 +579,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       accountId: Type.Optional(Type.String({ description: "要登出的账户 ID（可选，默认登出当前账户）" })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const accountId = params.accountId ?? currentAccount?.accountId;
 
       if (!accountId) {
@@ -539,7 +589,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      await performLogout(accountId);
+      await performLogout(accountId, ctx);
 
       return {
         content: [{ type: "text", text: `已退出账户 ${accountId.slice(0, 12)}...` }],
@@ -557,7 +607,7 @@ export default function (pi: ExtensionAPI) {
     description: "微信扫码登录",
     handler: async (_args, ctx) => {
       await ctx.ui.notify("正在启动微信登录...", "info");
-      const success = await performLogin();
+      const success = await performLogin(ctx);
       if (success) {
         await ctx.ui.notify("微信登录成功！", "info");
       } else {
@@ -578,6 +628,7 @@ export default function (pi: ExtensionAPI) {
       }
       status += `当前连接: ${isConnected ? "已连接" : "未连接"}`;
       await ctx.ui.notify(status, "info");
+      updateStatus(ctx);
     },
   });
 
@@ -585,7 +636,7 @@ export default function (pi: ExtensionAPI) {
   // 流处理 - 捕获 AI 回复并发送回微信
   // ============================================================================
 
-  pi.on("message_end", async (event) => {
+  pi.on("message_end", async (event, ctx) => {
     const message = event.message;
     // 只处理助手消息（AI 回复）
     if (message.role !== "assistant") {
@@ -605,6 +656,7 @@ export default function (pi: ExtensionAPI) {
       console.log(`[weixinbot] 未找到待回复的用户信息: reqId=${pendingMsg.reqId.slice(0, 8)}...`);
       pendingMessages.shift(); // 清理队列
       replyToMap.delete(pendingMsg.reqId);
+      updateStatus(ctx); // 更新状态栏
       return;
     }
 
@@ -620,6 +672,7 @@ export default function (pi: ExtensionAPI) {
       console.log(`[weixinbot] AI 回复为空，跳过发送`);
       pendingMessages.shift(); // 清理队列
       replyToMap.delete(pendingMsg.reqId);
+      updateStatus(ctx); // 更新状态栏
       return;
     }
 
@@ -635,7 +688,10 @@ export default function (pi: ExtensionAPI) {
     // 清理
     pendingMessages.shift();
     replyToMap.delete(pendingMsg.reqId);
-    
+
+    // 更新状态栏显示待处理消息数
+    updateStatus(ctx);
+
     // 继续处理队列中的下一条消息
     processMessageQueue();
   });
@@ -660,7 +716,7 @@ export default function (pi: ExtensionAPI) {
         isConnected = true;
 
         // 启动消息监控
-        startMonitor();
+        startMonitor(pi);
 
         console.log(`[weixinbot] 已恢复连接: ${account.accountId?.slice(0, 12)}...`);
 
@@ -669,6 +725,9 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }
+
+    // 初始化状态栏
+    updateStatus(ctx);
   });
 
   // 会话关闭时停止监控

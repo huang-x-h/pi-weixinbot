@@ -14,56 +14,93 @@
 
 ## 安装
 
-### 方式一：作为 pi package 安装（推荐）
+### 方式一：通过 pi install 安装（推荐）
 
 ```bash
-pi pkg install pi-weixinbot
+# 从 npm 安装（如果已发布）
+pi install npm:pi-weixinbot
+
+# 从 GitHub 安装
+pi install git:github.com/huang-x-h/pi-weixinbot
 ```
 
-### 方式二：手动安装
+### 方式二：手动安装到扩展目录
 
 1. 克隆仓库到本地：
 ```bash
 git clone https://github.com/huang-x-h/pi-weixinbot.git
 ```
 
-2. 在项目目录安装依赖：
+2. 安装依赖：
 ```bash
 cd pi-weixinbot
 npm install
 ```
 
-3. 链接到 pi 扩展目录：
+3. 将扩展链接到 pi 扩展目录：
 ```bash
-# 创建符号链接或复制到扩展目录
-ln -s /path/to/pi-weixinbot ~/.pi/agent/extensions/pi-weixinbot
+# 全局安装（所有项目可用）
+ln -s $(pwd) ~/.pi/agent/extensions/pi-weixinbot
+
+# 或项目本地安装（仅当前项目可用）
+mkdir -p .pi/extensions
+ln -s $(pwd) .pi/extensions/pi-weixinbot
+```
+
+4. 重新加载 pi 以识别扩展：
+```
+/reload
+```
+
+### 方式三：临时测试（不安装）
+
+```bash
+# 克隆并进入目录
+git clone https://github.com/huang-x-h/pi-weixinbot.git
+cd pi-weixinbot
+npm install
+
+# 临时加载扩展进行测试
+pi -e ./src/weixin.ts
+```
+
+### 方式四：通过 settings.json 配置
+
+在 `~/.pi/agent/settings.json`（全局）或 `.pi/settings.json`（项目本地）中添加：
+
+```json
+{
+  "packages": [
+    "git:github.com/huang-x-h/pi-weixinbot"
+  ]
+}
 ```
 
 ## 使用方法
 
 ### 1. 登录微信
 
-启动 pi 后，使用命令登录微信：
+启动 pi 后，使用以下方式登录微信：
 
+**命令方式：**
 ```
 /weixin-login
 ```
 
-或者使用工具：
-
+**或工具方式：**
 ```
 使用 weixin_login 工具登录微信
 ```
 
 登录过程：
-1. 系统会输出一个二维码链接
+1. 系统会在终端显示二维码
 2. 使用微信扫描二维码
 3. 在手机上确认授权
 4. 登录成功后会自动开始接收消息
 
-### 2. 发送消息
+### 2. 接收和发送消息
 
-当收到微信消息时，AI 会自动处理并回复。
+当收到微信消息时，消息会自动转发给 AI 处理，AI 的回复会自动发送回微信。
 
 也可以手动发送消息：
 
@@ -78,7 +115,7 @@ ln -s /path/to/pi-weixinbot ~/.pi/agent/extensions/pi-weixinbot
 /weixin-status
 ```
 
-或者：
+或：
 
 ```
 使用 weixin_status 工具
@@ -123,7 +160,10 @@ ln -s /path/to/pi-weixinbot ~/.pi/agent/extensions/pi-weixinbot
 
 ## 数据存储
 
-登录信息存储在 `~/.pi/agent/weixin/` 目录：
+登录信息存储在 pi 数据目录：
+
+- 全局安装：`~/.pi/agent/weixin/`
+- 项目本地：`.pi/weixin/`
 
 ```
 ~/.pi/agent/weixin/
@@ -133,25 +173,52 @@ ln -s /path/to/pi-weixinbot ~/.pi/agent/extensions/pi-weixinbot
 └── config.json        # 全局配置
 ```
 
+## 扩展结构
+
+```
+pi-weixinbot/
+├── package.json       # 包含 pi 配置入口
+├── src/
+│   └── weixin.ts      # 扩展主入口
+└── README.md
+```
+
+`package.json` 中的 `pi.extensions` 定义了扩展入口文件：
+
+```json
+{
+  "pi": {
+    "extensions": ["./src/weixin.ts"]
+  }
+}
+```
+
 ## 注意事项
 
 1. **安全提示**：存储的 token 文件权限为 600，请确保系统安全
 2. **会话过期**：微信登录会话可能过期，如果出现错误请重新登录
 3. **多设备限制**：微信可能限制同一账号的并发连接数
+4. **pi 版本要求**：需要 pi 支持扩展功能的版本
 
 ## 故障排除
+
+### 扩展未加载
+
+- 确认扩展已正确安装到 `~/.pi/agent/extensions/` 或 `.pi/extensions/`
+- 运行 `/reload` 命令重新加载扩展
+- 检查 pi 启动日志中的加载错误信息
 
 ### 登录失败
 
 - 检查网络连接
 - 确认微信账号状态正常
-- 尝试重新生成二维码
+- 尝试重新生成二维码（重新执行 `/weixin-login`）
 
 ### 消息接收不到
 
-- 检查是否已登录成功
-- 确认 AI 正在运行
-- 查看日志中的错误信息
+- 检查是否已登录成功（运行 `/weixin-status`）
+- 确认 pi 正在运行中
+- 查看 pi 日志中的错误信息
 
 ### Session 过期
 
