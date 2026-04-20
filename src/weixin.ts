@@ -150,6 +150,7 @@ export default function (pi: ExtensionAPI) {
   const pendingMessages: PendingMessage[] = [];
   let isProcessing = false;
   let currentReqId: string | null = null;
+  let currentReplyTo: { userId: string; contextToken?: string } | null = null;
 
   // ============================================================================
   // 配置管理
@@ -193,15 +194,21 @@ export default function (pi: ExtensionAPI) {
     }
 
     currentReqId = message.reqId;
+    currentReplyTo = { userId: message.userId, contextToken: message.contextToken };
 
     try {
       await pi.sendUserMessage([{ type: "text", text: message.text }]);
-      console.log(`[weixinbot] 消息已发送: reqId=${message.reqId.slice(0, 8)}, 队列剩余=${pendingMessages.length - 1}`);
+      console.log(`[weixinbot] 消息已发送给AI: reqId=${message.reqId.slice(0, 8)}, user=${message.userId.slice(0, 8)}...`);
     } catch (err: any) {
-      console.error(`[weixinbot] 发送消息失败:`, err.message);
+      console.error(`[weixinbot] 发送消息给AI失败:`, err.message);
+      currentReplyTo = null;
     }
 
+    pendingMessages.shift();
     isProcessing = false;
+    
+    // 继续处理队列中的下一条消息
+    processMessageQueue();
   }
 
   // ============================================================================
@@ -564,6 +571,45 @@ export default function (pi: ExtensionAPI) {
       status += `当前连接: ${isConnected ? "已连接" : "未连接"}`;
       await ctx.ui.notify(status, "info");
     },
+  });
+
+  // ============================================================================
+  // 流处理 - 捕获 AI 回复并发送回微信
+  // ============================================================================
+
+  pi.on("message_end", async (event) => {
+    if (!currentReplyTo) return;
+
+    const message = event.message;
+    // 只处理助手消息（AI 回复）
+    if (message.role !== "assistant") {
+      currentReplyTo = null;
+      return;
+    }
+
+    // 提取文本内容
+    let replyText = "";
+    for (const content of message.content) {
+      if (content.type === "text") {
+        replyText += content.text;
+      }
+    }
+
+    if (!replyText.trim()) {
+      currentReplyTo = null;
+      return;
+    }
+
+    const { userId, contextToken } = currentReplyTo;
+
+    try {
+      await sendTextMessage(userId, replyText.trim(), contextToken);
+      console.log(`[weixinbot] AI 回复已发送给 ${userId.slice(0, 8)}... (${replyText.length} 字符)`);
+    } catch (err: any) {
+      console.error(`[weixinbot] 发送 AI 回复失败:`, err.message);
+    }
+
+    currentReplyTo = null;
   });
 
   // ============================================================================
