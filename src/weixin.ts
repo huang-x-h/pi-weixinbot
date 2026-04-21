@@ -26,6 +26,12 @@ import {
   logoutAccount,
   getStateDir,
 } from "./weixin-auth.ts";
+import {
+  acquireLock,
+  releaseLock,
+  checkLockStatus,
+  forceReleaseLock,
+} from "./lock-manager.ts";
 
 // ============================================================================
 // 类型定义
@@ -160,7 +166,7 @@ export default function (pi: ExtensionAPI) {
   // 状态栏更新
   // ============================================================================
 
-  function updateStatus(ctx: any) {
+  async function updateStatus(ctx: any) {
     if (!ctx?.ui?.setStatus) return;
 
     let status = "[微信]";
@@ -175,6 +181,16 @@ export default function (pi: ExtensionAPI) {
       status += ` ✅ 已连接 | ${accountShort}... | 待处理:${pending}`;
     } else {
       status += " ❌ 已断开";
+    }
+
+    // 添加锁状态
+    const lockStatus = await checkLockStatus();
+    if (lockStatus.locked) {
+      if (lockStatus.ownedByMe) {
+        status += " | 🔒";
+      } else {
+        status += " | ❌ 被占用";
+      }
     }
 
     ctx.ui.setStatus("weixinbot", status);
@@ -207,7 +223,7 @@ export default function (pi: ExtensionAPI) {
     isProcessing = true;
 
     // 更新状态栏显示待处理消息数
-    if (ctx) updateStatus(ctx);
+    if (ctx) await updateStatus(ctx);
 
     const message = pendingMessages[0];
     if (!message) {
@@ -395,9 +411,49 @@ export default function (pi: ExtensionAPI) {
 
   async function performLogin(ctx?: any): Promise<boolean> {
     try {
-      console.log(`[weixinbot] 开始微信扫码登录...`);
+      // 先检查是否已有保存的账户（token）
+      const config = await loadConfig();
+      const accounts = getLoggedInAccounts();
+
+      // 如果有已保存的账户，尝试直接加载（无需扫码）
+      if (config.lastAccountId) {
+        const savedAccount = accounts.find(a => a.accountId === config.lastAccountId);
+
+        if (savedAccount?.token) {
+          console.log(`[weixinbot] 发现已保存的账户，尝试直接加载...`);
+
+          // 尝试获取排他锁
+          const lockResult = await acquireLock(SESSION_ID, savedAccount.accountId);
+          if (!lockResult.success) {
+            console.log(`[weixinbot] 无法获取锁: ${lockResult.message}`);
+            if (ctx?.hasUI) {
+              await ctx.ui.notify(`[weixinbot] ${lockResult.message}`, "error");
+            }
+            await updateStatus(ctx);
+            return false;
+          }
+
+          currentAccount = savedAccount;
+          isConnected = true;
+
+          // 启动消息监控
+          startMonitor(pi);
+
+          console.log(`[weixinbot] 已从缓存加载: ${savedAccount.accountId?.slice(0, 12)}...`);
+
+          if (ctx?.hasUI) {
+            await ctx.ui.notify(`[weixinbot] 微信已连接（从缓存加载）`, "info");
+          }
+
+          await updateStatus(ctx);
+          return true;
+        }
+      }
+
+      // 没有保存的账户，走二维码登录流程
+      console.log(`[weixinbot] 未发现已保存账户，开始扫码登录...`);
       loginInProgress = true;
-      updateStatus(ctx);
+      await updateStatus(ctx);
 
       const result = await fullQRLogin({
         onStatus: (status, message) => {
@@ -417,24 +473,37 @@ export default function (pi: ExtensionAPI) {
         currentAccount = accounts.find(a => a.accountId === result.accountId) ?? null;
 
         if (currentAccount) {
+          // 尝试获取排他锁
+          const lockResult = await acquireLock(SESSION_ID, result.accountId);
+          if (!lockResult.success) {
+            console.log(`[weixinbot] 登录成功但无法获取锁: ${lockResult.message}`);
+            if (ctx?.hasUI) {
+              await ctx.ui.notify(`[weixinbot] ${lockResult.message}`, "error");
+            }
+            // 虽然登录成功，但不启动监控，因为锁被其他 session 持有
+            currentAccount = null;
+            await updateStatus(ctx);
+            return false;
+          }
+
           await saveConfig({ lastAccountId: result.accountId });
           isConnected = true;
 
           // 启动消息监控
           startMonitor(pi);
 
-          updateStatus(ctx);
+          await updateStatus(ctx);
           return true;
         }
       }
 
       console.log(`[weixinbot] 登录失败: ${result.message}`);
-      updateStatus(ctx);
+      await updateStatus(ctx);
       return false;
     } catch (err) {
       loginInProgress = false;
       console.error(`[weixinbot] 登录异常:`, err);
-      updateStatus(ctx);
+      await updateStatus(ctx);
       return false;
     }
   }
@@ -443,11 +512,12 @@ export default function (pi: ExtensionAPI) {
     logoutAccount(accountId);
     if (currentAccount?.accountId === accountId) {
       stopMonitor();
+      await releaseLock(SESSION_ID);
       currentAccount = null;
       isConnected = false;
     }
     console.log(`[weixinbot] 已退出登录`);
-    updateStatus(ctx);
+    await updateStatus(ctx);
   }
 
   // ============================================================================
@@ -514,9 +584,10 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const accounts = getLoggedInAccounts();
+      const lockStatus = await checkLockStatus();
 
       // 更新状态栏
-      updateStatus(ctx);
+      await updateStatus(ctx);
 
       let statusText = `[weixinbot] 状态:\n`;
       statusText += `- 已登录账户: ${accounts.length}\n`;
@@ -529,10 +600,67 @@ export default function (pi: ExtensionAPI) {
 
       statusText += `\n\n- 当前连接: ${isConnected ? "已连接" : "未连接"}`;
 
+      // 添加锁状态信息
+      if (lockStatus.locked) {
+        if (lockStatus.ownedByMe) {
+          statusText += `\n- 独占锁: 🔒 当前 session 持有`;
+        } else {
+          const otherSession = lockStatus.session?.sessionId?.slice(0, 8);
+          const otherPid = lockStatus.session?.pid;
+          statusText += `\n- 独占锁: ❌ 被其他 session 占用 (PID: ${otherPid}, Session: ${otherSession}...)`;
+        }
+      } else {
+        statusText += `\n- 独占锁: 🔓 未锁定`;
+      }
+
       return {
         content: [{ type: "text", text: statusText }],
-        details: {},
+        details: { lockStatus },
       };
+    },
+  });
+
+  // 强制释放锁工具（用于异常情况）
+  pi.registerTool({
+    name: "weixin_force_unlock",
+    label: "Weixin Force Unlock",
+    description: "强制释放微信 session 锁（谨慎使用！会中断其他 session 的连接）",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const lockStatus = await checkLockStatus();
+
+      if (!lockStatus.locked) {
+        return {
+          content: [{ type: "text", text: "当前没有锁，无需释放" }],
+          details: {},
+        };
+      }
+
+      if (lockStatus.ownedByMe) {
+        await releaseLock(SESSION_ID);
+        return {
+          content: [{ type: "text", text: "✅ 已释放当前 session 持有的锁" }],
+          details: {},
+        };
+      }
+
+      // 强制释放其他 session 的锁
+      const otherSession = lockStatus.session?.sessionId?.slice(0, 8);
+      const otherPid = lockStatus.session?.pid;
+
+      const success = await forceReleaseLock();
+      if (success) {
+        return {
+          content: [{ type: "text", text: `✅ 已强制释放 session ${otherSession}... (PID: ${otherPid}) 的锁` }],
+          details: {},
+        };
+      } else {
+        return {
+          content: [{ type: "text", text: "❌ 强制释放锁失败" }],
+          details: {},
+          isError: true,
+        };
+      }
     },
   });
 
@@ -621,14 +749,27 @@ export default function (pi: ExtensionAPI) {
     description: "查看微信连接状态",
     handler: async (_args, ctx) => {
       const accounts = getLoggedInAccounts();
+      const lockStatus = await checkLockStatus();
       let status = `已登录账户: ${accounts.length}\n`;
       for (const acc of accounts) {
         const isCurrent = currentAccount?.accountId === acc.accountId;
         status += `- ${acc.accountId?.slice(0, 12)}... ${isCurrent ? "(当前)" : ""}\n`;
       }
-      status += `当前连接: ${isConnected ? "已连接" : "未连接"}`;
+      status += `当前连接: ${isConnected ? "已连接" : "未连接"}\n`;
+
+      // 添加锁状态
+      if (lockStatus.locked) {
+        if (lockStatus.ownedByMe) {
+          status += `独占锁: 🔒 当前 session 持有`;
+        } else {
+          status += `独占锁: ❌ 被其他 session 占用`;
+        }
+      } else {
+        status += `独占锁: 🔓 未锁定`;
+      }
+
       await ctx.ui.notify(status, "info");
-      updateStatus(ctx);
+      await updateStatus(ctx);
     },
   });
 
@@ -656,7 +797,7 @@ export default function (pi: ExtensionAPI) {
       console.log(`[weixinbot] 未找到待回复的用户信息: reqId=${pendingMsg.reqId.slice(0, 8)}...`);
       pendingMessages.shift(); // 清理队列
       replyToMap.delete(pendingMsg.reqId);
-      updateStatus(ctx); // 更新状态栏
+      await updateStatus(ctx); // 更新状态栏
       return;
     }
 
@@ -672,7 +813,7 @@ export default function (pi: ExtensionAPI) {
       console.log(`[weixinbot] AI 回复为空，跳过发送`);
       pendingMessages.shift(); // 清理队列
       replyToMap.delete(pendingMsg.reqId);
-      updateStatus(ctx); // 更新状态栏
+      await updateStatus(ctx); // 更新状态栏
       return;
     }
 
@@ -690,7 +831,7 @@ export default function (pi: ExtensionAPI) {
     replyToMap.delete(pendingMsg.reqId);
 
     // 更新状态栏显示待处理消息数
-    updateStatus(ctx);
+    await updateStatus(ctx);
 
     // 继续处理队列中的下一条消息
     processMessageQueue();
@@ -700,40 +841,18 @@ export default function (pi: ExtensionAPI) {
   // 事件处理
   // ============================================================================
 
-  // 会话启动时恢复连接
+  // 会话启动时仅初始化状态（不自动连接微信）
   pi.on("session_start", async (_event, ctx) => {
-    console.log(`[weixinbot] 会话启动，尝试恢复微信连接...`);
-
-    // 加载配置
-    const config = await loadConfig();
-
-    if (config.lastAccountId) {
-      const accounts = getLoggedInAccounts();
-      const account = accounts.find(a => a.accountId === config.lastAccountId);
-
-      if (account) {
-        currentAccount = account;
-        isConnected = true;
-
-        // 启动消息监控
-        startMonitor(pi);
-
-        console.log(`[weixinbot] 已恢复连接: ${account.accountId?.slice(0, 12)}...`);
-
-        if (ctx.hasUI) {
-          ctx.ui.notify(`[weixinbot] 微信已连接: ${account.accountId?.slice(0, 12)}...`, "info");
-        }
-      }
-    }
-
+    console.log(`[weixinbot] 会话启动，等待用户执行 /weixin-login 连接微信...`);
     // 初始化状态栏
-    updateStatus(ctx);
+    await updateStatus(ctx);
   });
 
-  // 会话关闭时停止监控
+  // 会话关闭时停止监控并释放锁
   pi.on("session_shutdown", async (_event, _ctx) => {
-    console.log(`[weixinbot] 会话关闭，停止消息监控`);
+    console.log(`[weixinbot] 会话关闭，停止消息监控并释放锁`);
     stopMonitor();
+    await releaseLock(SESSION_ID);
   });
 
   // ============================================================================
