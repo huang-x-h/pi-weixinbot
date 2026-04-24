@@ -12,7 +12,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "@mariozechner/pi-ai";
 
 import {
   getUpdates,
