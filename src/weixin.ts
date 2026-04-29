@@ -169,13 +169,17 @@ export default function (pi: ExtensionAPI) {
   async function updateStatus(ctx: any) {
     if (!ctx?.ui?.setStatus) return;
 
+    // 未登录且非登录中时，不显示状态栏
+    if (!currentAccount && !loginInProgress) {
+      ctx.ui.setStatus("weixinbot", "");
+      return;
+    }
+
     let status = "[微信]";
 
     if (loginInProgress) {
       status += " ⏳ 登录中...";
-    } else if (!currentAccount) {
-      status += " ⚪ 未登录";
-    } else if (isConnected) {
+    } else if (isConnected && currentAccount) {
       const accountShort = currentAccount.accountId.slice(0, 8);
       const pending = pendingMessages.length;
       status += ` ✅ 已连接 | ${accountShort}... | 待处理:${pending}`;
@@ -784,10 +788,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // 未登录时不处理消息
+    if (!isConnected || !currentAccount) {
+      return;
+    }
+
     // 从队列中取出第一条消息（最早发送给 AI 的）
     const pendingMsg = pendingMessages[0];
     if (!pendingMsg) {
-      console.log(`[weixinbot] 收到 AI 回复，但没有待处理的微信消息`);
       return;
     }
 
